@@ -45,7 +45,7 @@ macro_rules! impl_test {
             let mut results = Vec::with_capacity(1000);
             for _ in 0..1000 {
                 let _ = snd.send(Instant::now());
-                sleep(Duration::from_millis(25)).await;
+                sleep(Duration::from_millis(10)).await;
                 results.push(t.load(Ordering::SeqCst));
             }
             results.sort_unstable();
