@@ -28,11 +28,12 @@ macro_rules! impl_test {
             let (snd, _) = $module::channel(Instant::now());
             let t = Arc::new(AtomicU64::new(0));
             for _ in 0..1000 {
-                let mut rcv = snd.subscribe();
+                let rcv = snd.subscribe();
                 let t = t.clone();
                 tokio::spawn(async move {
+                    tokio::pin!(rcv);
                     loop {
-                        if rcv.changed().await.is_err() {
+                        if rcv.as_mut().changed().await.is_err() {
                             break;
                         }
                         // read lock
