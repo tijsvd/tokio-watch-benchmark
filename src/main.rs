@@ -4,106 +4,160 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::sync::{watch, Notify};
+// use tokio::time::sleep;
 
 mod mywatch;
 
-fn do_work(start: Instant, t: &AtomicU64) {
-    let values: HashMap<i32, f64> = (1..=10).map(|i| (i, random())).collect();
-    let message = serde_json::to_vec(&values).unwrap();
-    let sum = message
-        .into_iter()
-        .map(|c| c as u32)
-        .fold(0, u32::wrapping_add);
-    if sum == 1337 {
-        println!("foo");
-    }
-    t.store(start.elapsed().as_nanos() as u64, Ordering::Release);
+const NTASK: usize = 1000;
+const NREP: i32 = 1000;
+
+#[derive(Default)]
+struct WorkGroup {
+    count: AtomicU64,
+    done_n: Notify,
 }
 
-macro_rules! impl_test {
-    ($name:ident, $module:ident) => {
-        async fn $name() {
-            let (snd, _) = $module::channel(Instant::now());
-            let t = Arc::new(AtomicU64::new(0));
-            for _ in 0..1000 {
-                let rcv = snd.subscribe();
-                let t = t.clone();
-                tokio::spawn(async move {
-                    tokio::pin!(rcv);
-                    loop {
-                        if rcv.as_mut().changed().await.is_err() {
-                            break;
+impl WorkGroup {
+    fn add(&self, n: u64) {
+        self.count.fetch_add(n, Ordering::Relaxed);
+    }
+    fn done(&self) {
+        if self.count.fetch_sub(1, Ordering::Release) == 1 {
+            self.done_n.notify_one();
+        }
+    }
+    async fn wait(&self) {
+        while self.count.load(Ordering::Acquire) > 0 {
+            self.done_n.notified().await; // notify_one buffers
+        }
+    }
+}
+
+fn do_work(rng: &mut impl RngCore) -> u32 {
+    // let start = Instant::now();
+    let values: HashMap<i32, f64> = (1..=10).map(|i| (i, rng.gen())).collect();
+    let message = serde_json::to_vec(&values).unwrap();
+    message
+        .into_iter()
+        .map(|c| c as u32)
+        .fold(0, u32::wrapping_add)
+}
+
+macro_rules! def_test {
+    ($modname:ident, $defname:ident) => {
+        mod $defname {
+            use super::*;
+
+            async fn one_rep(i: i32, snd: &$modname::Sender<i32>, wg: &WorkGroup) -> u64 {
+                wg.add(NTASK as u64);
+                let start = Instant::now();
+                let _ = snd.send(i);
+                wg.wait().await;
+                start.elapsed().as_nanos() as u64
+            }
+
+            pub async fn run_test() {
+                let (snd, _) = $modname::channel(0i32);
+                let wg = Arc::new(WorkGroup::default());
+                for n in 0..NTASK {
+                    let mut rcv = snd.subscribe();
+                    let wg = wg.clone();
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(n as u64);
+                    tokio::spawn(async move {
+                        loop {
+                            if rcv.changed().await.is_err() {
+                                break;
+                            }
+                            let _ = *rcv.borrow();
+                            let r = do_work(&mut rng);
+                            if r == 1337 {
+                                println!("coincidence...");
+                            }
+                            wg.done();
                         }
-                        // read lock
-                        let start = *rcv.borrow();
-                        do_work(start, &t);
-                    }
-                });
+                    });
+                }
+                // warmup
+                let warmup_start = Instant::now();
+                while warmup_start.elapsed() < Duration::from_millis(25) {
+                    one_rep(42, &snd, &wg).await;
+                }
+                let mut results = Vec::with_capacity(NREP as usize);
+                println!("start");
+                for i in 0..NREP {
+                    results.push(one_rep(i, &snd, &wg).await);
+                }
+                assert_eq!(results.len(), NREP as usize);
+                results.sort_unstable();
+                let avg = results.iter().copied().sum::<u64>() / NREP as u64;
+                let l = NREP as usize;
+                println!(
+                    "avg={:?}  <{:?} [ {:?} {:?} {:?} ] {:?}>",
+                    Duration::from_nanos(avg),
+                    Duration::from_nanos(results[l / 20]),
+                    Duration::from_nanos(results[l / 4]),
+                    Duration::from_nanos(results[l / 2]),
+                    Duration::from_nanos(results[l * 3 / 4]),
+                    Duration::from_nanos(results[l * 19 / 20]),
+                );
             }
-            sleep(Duration::from_millis(25)).await;
-            let mut results = Vec::with_capacity(1000);
-            for _ in 0..1000 {
-                let _ = snd.send(Instant::now());
-                sleep(Duration::from_millis(10)).await;
-                results.push(t.load(Ordering::SeqCst));
-            }
-            results.sort_unstable();
-            let avg = results.iter().copied().sum::<u64>() / 1000;
-            println!(
-                "avg={:?}  <{:?} [ {:?} {:?} {:?} ] {:?}>",
-                Duration::from_nanos(avg),
-                Duration::from_nanos(results[50]),
-                Duration::from_nanos(results[250]),
-                Duration::from_nanos(results[500]),
-                Duration::from_nanos(results[750]),
-                Duration::from_nanos(results[950]),
-            );
         }
     };
 }
 
-impl_test!(run_test, watch);
-impl_test!(run_test_my, mywatch);
+def_test!(watch, wtest);
+def_test!(mywatch, mytest);
 
 fn main() {
     println!("TOKIO WATCH");
+    /*
     println!("running single thread");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run_test());
+        .block_on(wtest::run_test());
+    */
+    println!("running single thread with spawned sender");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { tokio::spawn(wtest::run_test()).await.unwrap() });
+    /*
     println!("running multi thread with main thread sender");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run_test());
+        .block_on(wtest::run_test());
+    */
     println!("running multi thread with spawned sender");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { tokio::spawn(run_test()).await.unwrap() });
+        .block_on(async { tokio::spawn(wtest::run_test()).await.unwrap() });
     println!("CUSTOM WATCH");
+    /*
     println!("running single thread");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run_test_my());
+        .block_on(mytest::run_test());
     println!("running multi thread with main thread sender");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run_test_my());
+        .block_on(mytest::run_test());
+    */
     println!("running multi thread with spawned sender");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(async { tokio::spawn(run_test_my()).await.unwrap() });
+        .block_on(async { tokio::spawn(mytest::run_test()).await.unwrap() });
 }
